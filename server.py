@@ -29,10 +29,12 @@ class ChatServer:
 
         while self.running:
             try:
+                # Wartet bis ein Client verbinden möchte und akzeptiert dann
                 client_socket, client_address = self.server_socket.accept()
 
                 print(f"New connection from {client_address}")
 
+                # Für jeden neuen Client wird ein eigener Thread erstellt, damit mehrere Clients gleichzeitig schreiben können
                 client_thread = threading.Thread(
                     target=self.handle_client,
                     args=(client_socket, client_address),
