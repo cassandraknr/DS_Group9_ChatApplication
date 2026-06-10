@@ -1,104 +1,116 @@
 import socket
 import threading
-import uuid
 
-class ChatClient:
-    #Server Adresse und Port sind auf den eigenen Rechner gesetzt und müssen später durch UDP Discovery ersetzt werden.
-    def __init__(self, username, server_host = "127.0.0.1", server_port = 5000):
-        #Für die Anzeige des Usernames
-        self.username = username
-        #Für die technische Identität des Clients
-        self.client_id = str(uuid.uuid4())
 
-        self.server_host = server_host
-        self.server_port = server_port
-        self.socket = None
+class ChatServer:
+    def __init__(self, host="0.0.0.0", port=5000):
+        self.host = host
+        self.port = port
+        self.server_socket = None
         self.running = False
-
-    def discover_leader(self):
-        #Placeholder for UDP Discovery
-        return self.server_host, self.server_port
-
-    def connect_to_leader(self):
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.server_host, self.server_port))
-            self.running = True
-
-            # 
-            join_message = f"JOIN:{self.client_id}:{self.username}"
-            self.socket.sendall(join_message.encode("utf-8"))
-
-            print(f"Connected to leader at {self.server_host}:{self.server_port}")
-            print(f"Client ID: {self.client_id}")
-
-        except ConnectionRefusedError:
-            print("Could not connect to leader server. Is the server running?")
-            self.running = False
-
-        except OSError as error:
-            print(f"Connection error: {error}")
-            self.running = False
-
-    def receive_messages(self):
-        while self.running:
-            try:
-                message = self.socket.recv(1024).decode("utf-8")
-
-                if not message:
-                    print("Connection to server closed.")
-                    self.running = False
-                    break
-
-                print(message)
-
-            except OSError:
-                print("Lost connection to leader server.")
-                self.running = False
-                break
-
-    def send_messages(self):
-        while self.running:
-            try:
-                message = input()
-
-                if message.lower() == "/quit":
-                    self.stop()
-                    break
-
-                full_message = f"MESSAGE:{self.client_id}:{self.username}:{message}"
-                self.socket.sendall(full_message.encode("utf-8"))
-
-            except OSError:
-                print("Could not send message. Connection lost.")
-                self.running = False
-                break
+        self.clients = {}
 
     def start(self):
-        self.discover_leader()
-        self.connect_to_leader()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen()
+        self.running = True
+        print(f"Chat server started on {self.host}:{self.port}")
 
-        if not self.running:
+        while self.running:
+            try:
+                client_socket, client_address = self.server_socket.accept()
+                print(f"New connection from {client_address}")
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, client_address),
+                    daemon=True
+                )
+                client_thread.start()
+            except OSError:
+                break
+
+    def handle_client(self, client_socket, client_address):
+        try:
+            while self.running:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                message = data.decode("utf-8")
+                self.process_message(client_socket, message)
+        except OSError:
+            print(f"Connection lost: {client_address}")
+        finally:
+            self.remove_client(client_socket)
+
+    def process_message(self, client_socket, message):
+        parts = message.split(":", 3)
+        message_type = parts[0]
+        if message_type == "JOIN":
+            self.handle_join(client_socket, parts)
+        elif message_type == "MESSAGE":
+            self.handle_chat_message(parts)
+        else:
+            print(f"Unknown message format: {message}")
+
+    def handle_join(self, client_socket, parts):
+        if len(parts) < 3:
             return
+        client_id = parts[1]
+        username  = parts[2]
+        self.clients[client_socket] = {"client_id": client_id, "username": username}
+        print(f"{username} joined the chat. Client ID: {client_id}")
+        self.broadcast(f"SERVER: {username} joined the chat.", sender_socket=client_socket)
 
-        receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
-        receive_thread.start()
+    def handle_chat_message(self, parts):
+        if len(parts) < 4:
+            return
+        username = parts[2]
+        text     = parts[3]
+        chat_message = f"{username}: {text}"
+        print(chat_message)
+        self.broadcast(chat_message)
 
-        self.send_messages()
+    def broadcast(self, message, sender_socket=None):
+        disconnected = []
+        for client_socket in self.clients:
+            if client_socket == sender_socket:
+                continue
+            try:
+                client_socket.sendall(message.encode("utf-8"))
+            except OSError:
+                disconnected.append(client_socket)
+        for client_socket in disconnected:
+            self.remove_client(client_socket)
+
+    def remove_client(self, client_socket):
+        client_info = self.clients.get(client_socket)
+        if client_info:
+            username = client_info["username"]
+            print(f"{username} disconnected.")
+            del self.clients[client_socket]
+            self.broadcast(f"SERVER: {username} left the chat.")
+        try:
+            client_socket.close()
+        except OSError:
+            pass
 
     def stop(self):
         self.running = False
-
-        if self.socket:
+        for client_socket in list(self.clients.keys()):
+            self.remove_client(client_socket)
+        if self.server_socket:
             try:
-                self.socket.close()
+                self.server_socket.close()
             except OSError:
                 pass
+        print("Server stopped.")
 
-        print("Client stopped.")
 
 if __name__ == "__main__":
-    username = input("Enter username: ")
-
-    client = ChatClient(username)
-    client.start()
+    server = ChatServer(host="0.0.0.0", port=5000)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()
