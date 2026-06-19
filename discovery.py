@@ -1,166 +1,207 @@
-"""
-discovery.py – Dynamic Leader Discovery via UDP Multicast
-=========================================================
-
-Zwei Klassen:
-
-  DiscoveryListener  → läuft auf dem Leader-Knoten als Hintergrund-Thread
-                       Empfängt Multicast-Anfragen und antwortet mit
-                       IP + Chat-Port des Leaders
-
-  DiscoveryClient    → läuft im ChatClient
-                       Sendet Multicast-Anfrage, wartet auf Antwort des Leaders
-                       Gibt (ip, port) zurück
-
-Ersetzt den Placeholder in client.py:
-    def discover_leader(self):
-        # Placeholder for UDP Discovery  ← wird durch DiscoveryClient ersetzt
-"""
-
 import socket
-import struct
-import json
 import threading
+import json
 import time
+from typing import Callable
 
-# ══════════════════════════════════════════════════════════════════
-# KONFIGURATION – muss in allen Files identisch sein
-# ══════════════════════════════════════════════════════════════════
-MCAST_GROUP = "224.1.1.1"
-MCAST_PORT  = 5007
+DISCOVERY_PORT = 5007
+BROADCAST_IP = "255.255.255.255"
+BUFFER_SIZE = 4096
 
 
-# ══════════════════════════════════════════════════════════════════
-# TEIL 1: LISTENER (läuft auf dem Leader-Knoten)
-#
-# Der Leader lauscht auf Multicast-Anfragen.
-# Kommt eine DISCOVER_LEADER-Nachricht an, antwortet er direkt
-# per Unicast mit seiner IP + Chat-Port an den anfragenden Client.
-# ══════════════════════════════════════════════════════════════════
-class DiscoveryListener:
-    """
-    Wird in node.py aufgerufen, sobald dieser Knoten Leader wird.
+def create_udp_socket(bind_port=None, broadcast=False):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    Beispiel:
-        listener = DiscoveryListener(my_ip="127.0.0.1", chat_port=5000)
-        listener.start()   # wenn ich Leader werde
-        listener.stop()    # wenn ich nicht mehr Leader bin
-    """
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
-    def __init__(self, my_ip: str, chat_port: int):
-        self.my_ip     = my_ip
+    if broadcast:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    if bind_port is not None:
+        sock.bind(("", bind_port))
+
+    sock.settimeout(1.0)
+    return sock
+
+
+class ServerDiscovery:
+    def __init__(
+        self,
+        my_uid,
+        my_ip,
+        ring_port,
+        hb_port,
+        chat_port,
+        on_members_changed=None,
+        is_leader_func=None,
+    ):
+        self.my_uid = my_uid
+        self.my_ip = my_ip
+        self.ring_port = ring_port
+        self.hb_port = hb_port
         self.chat_port = chat_port
-        self._running  = False
-        self._sock     = None
+
+        self.on_members_changed = on_members_changed
+        self.is_leader_func = is_leader_func
+
+        self.running = False
+        self.members = {
+            self.my_uid: {
+                "uid": self.my_uid,
+                "ip": self.my_ip,
+                "ring_port": self.ring_port,
+                "hb_port": self.hb_port,
+                "chat_port": self.chat_port,
+                "last_seen": time.time(),
+            }
+        }
 
     def start(self):
-        """Startet den Listener als Hintergrund-Thread."""
-        self._running = True
-        threading.Thread(target=self._listen_loop, daemon=True, name="discovery-listener").start()
-        print(f"[DISCOVERY] Listener aktiv – lausche auf {MCAST_GROUP}:{MCAST_PORT}")
+        self.running = True
+        threading.Thread(target=self._announce_loop, daemon=True).start()
+        threading.Thread(target=self._listen_loop, daemon=True).start()
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+        print("[DISCOVERY] Server discovery started.")
 
     def stop(self):
-        """Stoppt den Listener."""
-        self._running = False
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        self.running = False
+
+    def get_members(self):
+        return [
+            {
+                "uid": m["uid"],
+                "ip": m["ip"],
+                "ring_port": m["ring_port"],
+                "hb_port": m["hb_port"],
+            }
+            for m in self.members.values()
+        ]
+
+    def _announce_loop(self):
+        sock = create_udp_socket(broadcast=True)
+
+        while self.running:
+            msg = {
+                "type": "SERVER_ANNOUNCE",
+                "uid": self.my_uid,
+                "ip": self.my_ip,
+                "ring_port": self.ring_port,
+                "hb_port": self.hb_port,
+                "chat_port": self.chat_port,
+            }
+
+            sock.sendto(json.dumps(msg).encode("utf-8"), (BROADCAST_IP, DISCOVERY_PORT))
+            time.sleep(2)
 
     def _listen_loop(self):
-        # UDP-Socket für Multicast-Empfang erstellen
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("", MCAST_PORT))
+        sock = create_udp_socket(bind_port=DISCOVERY_PORT, broadcast=True)
 
-        # Multicast-Gruppe "abonnieren" – wie Newsletter anmelden
-        group = struct.pack("4sL", socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
-        self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, group)
-        self._sock.settimeout(1.0)
-
-        while self._running:
+        while self.running:
             try:
-                data, addr = self._sock.recvfrom(1024)
-                msg = json.loads(data.decode())
+                data, addr = sock.recvfrom(BUFFER_SIZE)
+                msg = json.loads(data.decode("utf-8"))
 
-                if msg.get("type") == "DISCOVER_LEADER":
-                    # ✅ Client fragt "Wer ist Leader?" → ich antworte
-                    print(f"[DISCOVERY] Anfrage von {addr[0]} – ich bin Leader, antworte.")
-                    response = json.dumps({
-                        "type":      "LEADER_RESPONSE",
-                        "leader_ip": self.my_ip,
-                        "chat_port": self.chat_port,
-                    }).encode()
-                    # Direkte Unicast-Antwort zurück an den Client
-                    reply = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    reply.sendto(response, addr)
-                    reply.close()
+                if msg.get("type") == "SERVER_ANNOUNCE":
+                    self._handle_server_announce(msg)
+
+                elif msg.get("type") == "DISCOVER_LEADER":
+                    self._handle_leader_discovery(addr)
 
             except socket.timeout:
-                pass  # Normal – weiter lauschen
+                pass
             except OSError:
                 break
+            except Exception as e:
+                print(f"[DISCOVERY] Error: {e}")
+
+    def _handle_server_announce(self, msg):
+        uid = msg["uid"]
+
+        old_members = set(self.members.keys())
+
+        self.members[uid] = {
+            "uid": uid,
+            "ip": msg["ip"],
+            "ring_port": msg["ring_port"],
+            "hb_port": msg["hb_port"],
+            "chat_port": msg["chat_port"],
+            "last_seen": time.time(),
+        }
+
+        new_members = set(self.members.keys())
+
+        if old_members != new_members:
+            print(f"[DISCOVERY] New server discovered: {uid[:8]}...")
+            if self.on_members_changed:
+                self.on_members_changed(self.get_members())
+
+    def _handle_leader_discovery(self, addr):
+        if self.is_leader_func and self.is_leader_func():
+            response = {
+                "type": "LEADER_RESPONSE",
+                "leader_ip": self.my_ip,
+                "chat_port": self.chat_port,
+            }
+
+            sock = create_udp_socket()
+            sock.sendto(json.dumps(response).encode("utf-8"), addr)
+            sock.close()
+
+    def _cleanup_loop(self):
+        while self.running:
+            now = time.time()
+            removed = []
+
+            for uid, member in list(self.members.items()):
+                if uid == self.my_uid:
+                    continue
+
+                if now - member["last_seen"] > 8:
+                    removed.append(uid)
+                    del self.members[uid]
+
+            if removed:
+                print(f"[DISCOVERY] Removed inactive servers: {[uid[:8] for uid in removed]}")
+                if self.on_members_changed:
+                    self.on_members_changed(self.get_members())
+
+            time.sleep(3)
 
 
-# ══════════════════════════════════════════════════════════════════
-# TEIL 2: CLIENT (ersetzt Placeholder in client.py)
-#
-# Sendet DISCOVER_LEADER per Multicast ins Netz.
-# Wartet auf Antwort des Leaders.
-# Gibt (ip, port) zurück – fertig.
-# ══════════════════════════════════════════════════════════════════
 class DiscoveryClient:
-    """
-    Wird in ChatClient.discover_leader() aufgerufen.
-
-    Beispiel:
-        dc = DiscoveryClient()
-        result = dc.find_leader()
-        if result:
-            ip, port = result
-    """
-
-    def __init__(self, timeout: float = 3.0, retries: int = 5):
+    def __init__(self, timeout=3.0, retries=5):
         self.timeout = timeout
         self.retries = retries
 
-    def find_leader(self) -> tuple[str, int] | None:
-        """
-        Sendet Multicast-Anfrage und wartet auf Leader-Antwort.
-
-        Returns:
-            (leader_ip, chat_port) oder None wenn kein Leader gefunden
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    def find_leader(self):
+        sock = create_udp_socket(broadcast=True)
+        sock.bind(("", 0))
         sock.settimeout(self.timeout)
-        # TTL=1: Multicast bleibt im lokalen Netz (nicht ins Internet)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack("b", 1))
-        sock.bind(("", 0))  # Freien Port für Antwort reservieren
 
-        discover_msg = json.dumps({"type": "DISCOVER_LEADER"}).encode()
+        msg = {"type": "DISCOVER_LEADER"}
 
         for attempt in range(1, self.retries + 1):
             print(f"[DISCOVERY] Suche Leader … (Versuch {attempt}/{self.retries})")
 
-            # Multicast ins Netz schicken: "Wer ist der Leader?"
-            sock.sendto(discover_msg, (MCAST_GROUP, MCAST_PORT))
+            sock.sendto(json.dumps(msg).encode("utf-8"), (BROADCAST_IP, DISCOVERY_PORT))
 
             try:
-                data, _ = sock.recvfrom(1024)
-                msg = json.loads(data.decode())
+                data, _ = sock.recvfrom(BUFFER_SIZE)
+                response = json.loads(data.decode("utf-8"))
 
-                if msg.get("type") == "LEADER_RESPONSE":
-                    leader_ip = msg["leader_ip"]
-                    chat_port = msg["chat_port"]
+                if response.get("type") == "LEADER_RESPONSE":
+                    leader_ip = response["leader_ip"]
+                    chat_port = response["chat_port"]
+
                     print(f"[DISCOVERY] ✓ Leader gefunden: {leader_ip}:{chat_port}")
                     sock.close()
                     return leader_ip, chat_port
 
             except socket.timeout:
-                print(f"[DISCOVERY] Keine Antwort – warte …")
+                print("[DISCOVERY] Keine Antwort.")
                 time.sleep(1)
 
         sock.close()
-        print("[DISCOVERY] Kein Leader gefunden.")
         return None

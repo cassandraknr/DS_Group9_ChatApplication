@@ -1,146 +1,171 @@
-"""
-node.py – Windows-kompatible Version mit automatischer Wahlwiederholung
-========================================================================
-
-Alle 3 Knoten laufen auf 127.0.0.1 mit verschiedenen Ports.
-Feste UIDs damit alle Knoten dieselbe Ring-Reihenfolge kennen.
-Knoten 3 gewinnt immer (größte UUID).
-
-Verwendung:
-  python node.py --id 1
-  python node.py --id 2
-  python node.py --id 3
-"""
-
 import threading
 import time
 import argparse
+import uuid
+import socket
 
-from lcr       import LCRNode
+from lcr import LCRNode
 from heartbeat import HeartbeatMonitor
-from server    import ChatServer
-from discovery import DiscoveryListener
+from server import ChatServer
+from discovery import ServerDiscovery
 
-IP = "127.0.0.1"
 
-# ══════════════════════════════════════════════════════════════════
-# FESTE KONFIGURATION – alle Knoten kennen diese Tabelle
-# Feste UIDs → alle Knoten einig über Ring-Reihenfolge
-# Knoten 3 hat größte UUID → gewinnt immer die Wahl
-# ══════════════════════════════════════════════════════════════════
-NODES = {
-    1: {
-        "uid":       "1111aaaa-0001-0001-0001-000000000001",
-        "ring_port": 10001,
-        "hb_port":   10101,
-        "chat_port": 5001,
-    },
-    2: {
-        "uid":       "2222bbbb-0002-0002-0002-000000000002",
-        "ring_port": 10002,
-        "hb_port":   10102,
-        "chat_port": 5002,
-    },
-    3: {
-        "uid":       "3333cccc-0003-0003-0003-000000000003",
-        "ring_port": 10003,
-        "hb_port":   10103,
-        "chat_port": 5003,
-    },
-}
-
-# Mitgliederliste im Format das LCR und Heartbeat brauchen
-MEMBERS = [
-    {"uid": NODES[i]["uid"], "ip": IP,
-     "ring_port": NODES[i]["ring_port"],
-     "hb_port":   NODES[i]["hb_port"]}
-    for i in NODES
-]
+def get_local_ip():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
 
 
 class Node:
+    def __init__(self, uid, ring_port, hb_port, chat_port, ip=None):
+        self.my_uid = uid
+        self.my_ip = ip or get_local_ip()
 
-    def __init__(self, node_id: int):
-        self.node_id  = node_id
-        cfg = NODES[node_id]
+        self.ring_port = ring_port
+        self.hb_port = hb_port
+        self.chat_port = chat_port
 
-        self.my_uid   = cfg["uid"]
-        self.my_ip    = IP
-        self.ring_port = cfg["ring_port"]
-        self.hb_port   = cfg["hb_port"]
-        self.chat_port = cfg["chat_port"]
+        self.members = [
+            {
+                "uid": self.my_uid,
+                "ip": self.my_ip,
+                "ring_port": self.ring_port,
+                "hb_port": self.hb_port,
+            }
+        ]
+
+        self._leader_services_started = False
 
         self._lcr = LCRNode(
-            my_uid           = self.my_uid,
-            my_ip            = self.my_ip,
-            my_ring_port     = self.ring_port,
-            members          = MEMBERS,
-            on_leader_elected= self._on_leader_elected,
+            my_uid=self.my_uid,
+            my_ip=self.my_ip,
+            my_ring_port=self.ring_port,
+            members=self.members,
+            on_leader_elected=self._on_leader_elected,
         )
 
         self._heartbeat = HeartbeatMonitor(
-            my_ip      = self.my_ip,
-            my_hb_port = self.hb_port,
-            on_timeout = self._on_leader_timeout,
+            my_ip=self.my_ip,
+            my_hb_port=self.hb_port,
+            on_timeout=self._on_leader_timeout,
         )
 
         self._chat_server = ChatServer(host=self.my_ip, port=self.chat_port)
-        self._discovery   = DiscoveryListener(my_ip=self.my_ip, chat_port=self.chat_port)
+
+        self._discovery = ServerDiscovery(
+            my_uid=self.my_uid,
+            my_ip=self.my_ip,
+            ring_port=self.ring_port,
+            hb_port=self.hb_port,
+            chat_port=self.chat_port,
+            on_members_changed=self._on_members_changed,
+            is_leader_func=lambda: self._lcr.is_leader,
+        )
 
     def start(self):
-        print(f"\n{'='*55}")
-        print(f"  Knoten {self.node_id} startet")
-        print(f"  UUID      : {self.my_uid}")
-        print(f"  Ring-Port : {self.ring_port}")
-        print(f"  HB-Port   : {self.hb_port}")
-        print(f"  Chat-Port : {self.chat_port}")
-        print(f"{'='*55}\n")
+        print("\n" + "=" * 55)
+        print(" Node startet")
+        print(f" UID       : {self.my_uid}")
+        print(f" IP        : {self.my_ip}")
+        print(f" Ring-Port : {self.ring_port}")
+        print(f" HB-Port   : {self.hb_port}")
+        print(f" Chat-Port : {self.chat_port}")
+        print("=" * 55 + "\n")
 
-        # LCR-Ring-Socket starten
+        self._discovery.start()
         self._lcr.start()
 
-        # Wahl-Loop starten – wiederholt alle 5s bis ein Leader gefunden ist
-        threading.Thread(target=self._election_loop, daemon=True, name="election-loop").start()
+        threading.Thread(target=self._election_loop, daemon=True).start()
 
     def _election_loop(self):
-        """
-        Startet alle 5 Sekunden eine neue Wahl, bis ein Leader bekannt ist.
-        So spielt es keine Rolle in welcher Reihenfolge die Knoten starten.
-        """
-        time.sleep(2)  # kurz warten bis Socket bereit ist
-        while not self._lcr.leader_uid:
-            print(f"[NODE] Starte Wahl (kein Leader bekannt)…")
-            self._lcr.initiate_election()
-            time.sleep(5)  # 5 Sekunden warten, dann nochmal falls nötig
+        time.sleep(5)
 
-    def _on_leader_elected(self, leader_uid: str):
-        am_leader = (leader_uid == self.my_uid)
-        print(f"\n[NODE] ✓ Wahl abgeschlossen!")
+        while True:
+            if not self._lcr.leader_uid and len(self.members) >= 1:
+                print("[NODE] Starte Leader Election …")
+                self._lcr.initiate_election()
+
+            time.sleep(6)
+
+    def _on_members_changed(self, members):
+        self.members = members
+
+        print("[NODE] Aktuelle dynamische Members:")
+        for member in self.members:
+            print(f"  - {member['uid'][:8]}... Ring-Port={member['ring_port']}")
+
+        self._lcr.update_members(self.members)
+        self._heartbeat.update_members(self.members)
+
+        self._lcr.leader_uid = ""
+        self._lcr.is_leader = False
+
+        print("[NODE] Member-Änderung erkannt. Neue Election wird gestartet.")
+
+    def _on_leader_elected(self, leader_uid):
+        am_leader = leader_uid == self.my_uid
+
+        print("\n[NODE] ✓ Wahl abgeschlossen!")
         print(f"[NODE]   Leader: {leader_uid[:8]}…")
         print(f"[NODE]   Bin ich Leader: {am_leader}\n")
 
         if am_leader:
-            threading.Thread(target=self._chat_server.start, daemon=True, name="chat-server").start()
+            if self._leader_services_started:
+                print("[NODE] Leader services already running. Skip restart.")
+                return
+
+            self._leader_services_started = True
+
+            threading.Thread(
+                target=self._chat_server.start,
+                daemon=True,
+                name="chat-server",
+            ).start()
+
             print(f"[NODE] ✓ ChatServer läuft auf Port {self.chat_port}")
-            self._discovery.start()
-            self._heartbeat.start(is_leader=True, members=MEMBERS)
+
+            self._heartbeat.start(is_leader=True, members=self.members)
+
         else:
-            self._heartbeat.start(is_leader=False, members=MEMBERS)
+            self._leader_services_started = False
+            self._heartbeat.start(is_leader=False, members=self.members)
 
     def _on_leader_timeout(self):
-        print("\n[NODE] Leader ausgefallen! Starte neue Wahl…\n")
-        self._lcr.leader_uid = ""  # zurücksetzen damit election_loop neu startet
-        self._discovery.stop()
+        print("\n[NODE] Leader ausgefallen! Starte neue Wahl …\n")
+
+        self._lcr.leader_uid = ""
+        self._lcr.is_leader = False
+        self._leader_services_started = False
+
         threading.Thread(target=self._election_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--id", type=int, required=True, choices=[1, 2, 3],
-                        help="Knoten-ID: 1, 2 oder 3")
+
+    parser.add_argument("--uid", type=str, default=None)
+    parser.add_argument("--ring-port", type=int, required=True)
+    parser.add_argument("--hb-port", type=int, required=True)
+    parser.add_argument("--chat-port", type=int, required=True)
+    parser.add_argument("--ip", type=str, default=None)
+
     args = parser.parse_args()
 
-    node = Node(node_id=args.id)
+    uid = args.uid or str(uuid.uuid4())
+
+    node = Node(
+        uid=uid,
+        ring_port=args.ring_port,
+        hb_port=args.hb_port,
+        chat_port=args.chat_port,
+        ip=args.ip,
+    )
+
     node.start()
 
     try:
