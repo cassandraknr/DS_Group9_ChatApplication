@@ -14,9 +14,9 @@ def get_local_ip():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.connect(("8.8.8.8", 80))
-        ip = sock.getsockname()[0]
+        local_ip = sock.getsockname()[0]
         sock.close()
-        return ip
+        return local_ip
     except OSError:
         return "127.0.0.1"
 

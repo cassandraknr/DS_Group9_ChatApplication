@@ -151,4 +151,8 @@ class ChatClient:
 if __name__ == "__main__":
     username = input("Benutzername eingeben: ")
     client = ChatClient(username)
-    client.start()
+    try:
+        client.start()
+    except KeyboardInterrupt:
+        print("\nClient wird beendet.")
+        client.stop()
