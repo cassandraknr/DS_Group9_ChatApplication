@@ -9,25 +9,41 @@ class ChatServer:
         self.server_socket = None
         self.running = False
         self.clients = {}
+        self._start_lock = threading.Lock()
 
     def start(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen()
-        self.running = True
-        print(f"Chat server started on {self.host}:{self.port}")
+        with self._start_lock:
+
+        # Server läuft bereits
+            if self.running:
+                print(f"Chat server already running on {self.host}:{self.port}")
+                return
+
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            try:
+                self.server_socket.bind((self.host, self.port))
+                self.server_socket.listen()
+            except OSError as e:
+                print(f"Could not start chat server on {self.host}:{self.port}: {e}")
+                return
+
+            self.running = True
+            print(f"Chat server started on {self.host}:{self.port}")
 
         while self.running:
             try:
                 client_socket, client_address = self.server_socket.accept()
                 print(f"New connection from {client_address}")
+
                 client_thread = threading.Thread(
                     target=self.handle_client,
                     args=(client_socket, client_address),
                     daemon=True
                 )
                 client_thread.start()
+
             except OSError:
                 break
 

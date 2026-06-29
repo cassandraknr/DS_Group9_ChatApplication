@@ -1,158 +1,181 @@
-"""
-client.py – Chat-Client mit echter Dynamic Discovery
-=====================================================
-
-Änderung gegenüber dem Original:
-  discover_leader() war ein Placeholder → jetzt echte Multicast-Discovery
-  über DiscoveryClient aus discovery.py
-
-Alles andere (connect, send, receive) bleibt unverändert.
-"""
-
 import socket
 import threading
 import uuid
+import time
 
-# ── NEU: Discovery importieren ────────────────────────────────────
 from discovery import DiscoveryClient
 
 
 class ChatClient:
-
     def __init__(self, username):
-        self.username  = username
-        self.client_id = str(uuid.uuid4())  # Eindeutige UUID dieses Clients
+        self.username = username
+        self.client_id = str(uuid.uuid4())
 
-        # Adresse wird NICHT mehr fest gesetzt –
-        # discover_leader() füllt diese Felder dynamisch
         self.server_host = None
         self.server_port = None
 
-        self.socket  = None
+        self.socket = None
         self.running = False
+        self.stop_requested = False
+        self.reconnecting = False
 
-    # ══════════════════════════════════════════════════════════════
-    # DISCOVERY – Placeholder wurde durch echte Multicast-Logik ersetzt
-    #
-    # Vorher:
-    #   def discover_leader(self):
-    #       # Placeholder for UDP Discovery
-    #       return self.server_host, self.server_port
-    #
-    # Jetzt:
-    #   DiscoveryClient sendet Multicast → Leader antwortet →
-    #   server_host + server_port werden gesetzt
-    # ══════════════════════════════════════════════════════════════
-    def discover_leader(self) -> bool:
-        """
-        Sucht den Leader per Multicast-Discovery.
-        Setzt self.server_host und self.server_port wenn gefunden.
+        self.socket_lock = threading.Lock()
 
-        Returns:
-            True  → Leader gefunden
-            False → kein Leader erreichbar
-        """
-        dc     = DiscoveryClient(timeout=3.0, retries=5)
-        result = dc.find_leader()  # Blockiert bis Leader antwortet oder alle Versuche erschöpft
+    def discover_leader(self):
+        dc = DiscoveryClient(timeout=3.0, retries=5)
+        result = dc.find_leader()
 
         if result is None:
-            print("Kein Leader gefunden. Bitte zuerst Knoten starten.")
+            print("Kein Leader gefunden.")
             return False
 
-        # Leader gefunden → Adresse speichern
         self.server_host, self.server_port = result
         return True
 
-    # ══════════════════════════════════════════════════════════════
-    # VERBINDUNG ZUM LEADER – unverändert gegenüber Original
-    # ══════════════════════════════════════════════════════════════
     def connect_to_leader(self):
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.server_host, self.server_port))
+            with self.socket_lock:
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except OSError:
+                        pass
+
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.connect((self.server_host, self.server_port))
+
             self.running = True
 
-            # Beim Leader anmelden
             join_message = f"JOIN:{self.client_id}:{self.username}"
-            self.socket.sendall(join_message.encode("utf-8"))
+            self.send_raw(join_message)
 
             print(f"Verbunden mit Leader {self.server_host}:{self.server_port}")
             print(f"Client ID: {self.client_id}")
+            return True
 
-        except ConnectionRefusedError:
-            print("Verbindung abgelehnt. Läuft der Server?")
-            self.running = False
         except OSError as e:
             print(f"Verbindungsfehler: {e}")
             self.running = False
+            return False
 
-    # ══════════════════════════════════════════════════════════════
-    # NACHRICHTEN EMPFANGEN – unverändert
-    # ══════════════════════════════════════════════════════════════
+    def send_raw(self, message):
+        with self.socket_lock:
+            self.socket.sendall(message.encode("utf-8"))
+
+    def reconnect_to_leader(self):
+        if self.reconnecting or self.stop_requested:
+            return False
+
+        self.reconnecting = True
+        self.running = False
+
+        print("Suche neuen Leader...")
+
+        while not self.stop_requested:
+            if self.discover_leader() and self.connect_to_leader():
+                print("Reconnect erfolgreich.")
+
+                receive_thread = threading.Thread(
+                    target=self.receive_messages,
+                    daemon=True
+                )
+                receive_thread.start()
+
+                self.reconnecting = False
+                return True
+
+            print("Kein Leader erreichbar. Neuer Versuch in 3 Sekunden...")
+            time.sleep(3)
+
+        self.reconnecting = False
+        return False
+
     def receive_messages(self):
-        while self.running:
+        while self.running and not self.stop_requested:
             try:
                 message = self.socket.recv(1024).decode("utf-8")
+
                 if not message:
                     print("Verbindung zum Server getrennt.")
                     self.running = False
                     break
+
                 print(message)
+
             except OSError:
                 print("Verbindung zum Leader verloren.")
                 self.running = False
                 break
 
-    # ══════════════════════════════════════════════════════════════
-    # NACHRICHTEN SENDEN – unverändert
-    # ══════════════════════════════════════════════════════════════
+        if not self.stop_requested:
+            self.reconnect_to_leader()
+
     def send_messages(self):
-        while self.running:
+        while not self.stop_requested:
             try:
                 message = input()
+
                 if message.lower() == "/quit":
                     self.stop()
                     break
+
                 full_message = f"MESSAGE:{self.client_id}:{self.username}:{message}"
-                self.socket.sendall(full_message.encode("utf-8"))
-            except OSError:
-                print("Nachricht konnte nicht gesendet werden.")
-                self.running = False
+
+                if not self.running:
+                    print("Aktuell nicht verbunden. Warte auf Reconnect...")
+                    if not self.reconnecting:
+                        threading.Thread(target=self.reconnect_to_leader, daemon=True).start()
+
+                    while not self.running and not self.stop_requested:
+                        time.sleep(0.5)
+
+                if self.stop_requested:
+                    break
+
+                try:
+                    self.send_raw(full_message)
+                except OSError:
+                    print("Nachricht konnte nicht gesendet werden. Reconnect wird gestartet...")
+                    self.running = False
+
+                    if self.reconnect_to_leader():
+                        self.send_raw(full_message)
+
+            except KeyboardInterrupt:
+                print("\nClient wird beendet.")
+                self.stop()
                 break
 
-    # ══════════════════════════════════════════════════════════════
-    # START – Discovery läuft jetzt wirklich
-    # ══════════════════════════════════════════════════════════════
     def start(self):
-        # Schritt 1: Leader per Multicast finden
-        if not self.discover_leader():
-            return  # Kein Leader → abbrechen
+        while not self.stop_requested:
+            if self.discover_leader() and self.connect_to_leader():
+                break
 
-        # Schritt 2: Direkt mit Leader verbinden
-        self.connect_to_leader()
-        if not self.running:
+            print("Kein Leader erreichbar. Neuer Versuch in 3 Sekunden...")
+            time.sleep(3)
+
+        if self.stop_requested:
             return
 
-        # Schritt 3: Empfangen im Hintergrund, Senden im Vordergrund
         receive_thread = threading.Thread(target=self.receive_messages, daemon=True)
         receive_thread.start()
+
         self.send_messages()
 
     def stop(self):
+        self.stop_requested = True
         self.running = False
+
         if self.socket:
             try:
                 self.socket.close()
             except OSError:
                 pass
+
         print("Client beendet.")
 
 
 if __name__ == "__main__":
     username = input("Benutzername eingeben: ")
     client = ChatClient(username)
-    try:
-        client.start()
-    except KeyboardInterrupt:
-        print("\nClient wird beendet.")
-        client.stop()
+    client.start()

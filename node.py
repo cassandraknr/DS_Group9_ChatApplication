@@ -117,6 +117,7 @@ class Node:
         if am_leader:
             if self._leader_services_started:
                 print("[NODE] Leader services already running. Skip restart.")
+                self._heartbeat.start(is_leader=True, members=self.members)
                 return
 
             self._leader_services_started = True
@@ -128,10 +129,13 @@ class Node:
             ).start()
 
             print(f"[NODE] ✓ ChatServer läuft auf Port {self.chat_port}")
-
             self._heartbeat.start(is_leader=True, members=self.members)
 
         else:
+            if self._leader_services_started:
+                print("[NODE] Node is no longer leader. Stopping chat server.")
+                self._chat_server.stop()
+
             self._leader_services_started = False
             self._heartbeat.start(is_leader=False, members=self.members)
 
