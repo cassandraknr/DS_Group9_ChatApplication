@@ -1,7 +1,3 @@
-"""
-LCR Leader Election – Deadlock-freie Version
-"""
-
 import socket
 import threading
 import json
@@ -99,17 +95,13 @@ class LCRNode:
                 print(f"[LCR] Fehler: {e}")
 
     def _process(self, msg):
-        """
-        WICHTIG: Lock wird NUR kurz für Zustandsänderung gehalten.
-        Senden und Callbacks passieren AUSSERHALB des Locks → kein Deadlock.
-        """
         m             = msg["mid"]
         is_leader_msg = msg["isLeader"]
 
         to_send = None   # Nachricht die weitergeleitet werden soll
         callback = None  # Callback der aufgerufen werden soll
 
-        # ── Lock nur für Zustandsänderung ─────────────────────────
+        # Lock nur für Zustandsänderung 
         with self._lock:
             if is_leader_msg:
                 self.leader_uid  = m
@@ -140,7 +132,7 @@ class LCRNode:
                 callback = self._on_leader_elected
                 print(f"[LCR] ✓ Ich habe gewonnen! Sende COORDINATOR…")
 
-        # ── Senden und Callback AUSSERHALB des Locks ──────────────
+        # Senden und Callback außerhalb des Locks
         if to_send:
             self._send_msg(to_send)
         if callback:
@@ -151,7 +143,6 @@ class LCRNode:
             callback(self.leader_uid)
 
     def _send_msg(self, msg):
-        """Sendet Nachricht an den Nachbar – ohne Lock."""
         neighbour = self._neighbour
         if neighbour is None:
             print("[LCR] Kein Nachbar!")
