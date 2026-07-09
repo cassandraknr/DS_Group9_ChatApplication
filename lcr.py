@@ -73,6 +73,13 @@ class LCRNode:
             self._ring      = form_ring(members)
             self._neighbour = get_neighbour(self._ring, self.my_uid)
 
+    def reset_leader(self):
+        """Threadsicherer Reset des Leader-Zustands (statt direktem Zugriff von außen)."""
+        with self._lock:
+            self.leader_uid  = ""
+            self.is_leader   = False
+            self.participant = False
+
     def initiate_election(self):
         with self._lock:
             self.participant = True
@@ -101,12 +108,19 @@ class LCRNode:
         to_send = None   # Nachricht die weitergeleitet werden soll
         callback = None  # Callback der aufgerufen werden soll
 
-        # Lock nur für Zustandsänderung 
+        # Lock nur für Zustandsänderung
         with self._lock:
             if is_leader_msg:
+                already_known = (self.leader_uid == m and self.leader_uid != "")
                 self.leader_uid  = m
                 self.is_leader   = (m == self.my_uid)
                 self.participant = False
+
+                if already_known:
+                    # Diese Coordinator-Nachricht wurde bereits verarbeitet
+                    # (Duplikat/Ring-Inkonsistenz) -> hier stoppen, nicht weiterleiten.
+                    print(f"[LCR] Duplikat-Coordinator ignoriert: mid={m[:8]}…")
+                    return
                 callback = self._on_leader_elected
                 if not self.is_leader:
                     to_send = msg  # weiterleiten (außer wenn zurück bei mir)
@@ -149,6 +163,7 @@ class LCRNode:
             return
         try:
             data = json.dumps(msg).encode("utf-8")
+            print(f"[LCR] Sende an {neighbour['ip']}:{neighbour['ring_port']}")
             self._send_sock.sendto(data, (neighbour["ip"], neighbour["ring_port"]))
             print(f"[LCR] → Gesendet an Port {neighbour['ring_port']}: mid={msg['mid'][:8]}… isLeader={msg['isLeader']}")
         except OSError as e:

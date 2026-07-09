@@ -22,7 +22,7 @@ def get_local_ip():
 
 
 class Node:
-    def __init__(self, uid, ring_port, hb_port, chat_port, ip=None):
+    def __init__(self, uid, ring_port, hb_port, chat_port, ip=None, bootstrap_peers=None):
         self.my_uid = uid
         self.my_ip = ip or get_local_ip()
 
@@ -40,6 +40,7 @@ class Node:
         ]
 
         self._leader_services_started = False
+        self._election_running = False
 
         self._lcr = LCRNode(
             my_uid=self.my_uid,
@@ -65,6 +66,7 @@ class Node:
             chat_port=self.chat_port,
             on_members_changed=self._on_members_changed,
             is_leader_func=lambda: self._lcr.is_leader,
+            bootstrap_peers=bootstrap_peers,
         )
 
     def start(self):
@@ -87,8 +89,12 @@ class Node:
 
         while True:
             if not self._lcr.leader_uid and len(self.members) >= 1:
-                print("[NODE] Starte Leader Election …")
-                self._lcr.initiate_election()
+                if not self._election_running:
+                    self._election_running = True
+                    print("[NODE] Starte Leader Election …")
+                    self._lcr.initiate_election()
+                else:
+                    print("[NODE] Election läuft bereits. Warte auf Ergebnis …")
 
             time.sleep(6)
 
@@ -97,17 +103,26 @@ class Node:
 
         print("[NODE] Aktuelle dynamische Members:")
         for member in self.members:
-            print(f"  - {member['uid'][:8]}... Ring-Port={member['ring_port']}")
+            print(
+                f"  - {member['uid'][:8]}... "
+                f"IP={member['ip']} "
+                f"Ring-Port={member['ring_port']} "
+                f"HB-Port={member['hb_port']}"
+            )
 
         self._lcr.update_members(self.members)
         self._heartbeat.update_members(self.members)
 
-        self._lcr.leader_uid = ""
-        self._lcr.is_leader = False
+        # Alte Leader-Information zurücksetzen, weil sich die Ringstruktur geändert hat
+        self._lcr.reset_leader()
 
-        print("[NODE] Member-Änderung erkannt. Neue Election wird gestartet.")
+        # Neue Election darf gestartet werden
+        self._election_running = False
 
+        print("[NODE] Member-Änderung erkannt. Neue Election wird vorbereitet.")
+        
     def _on_leader_elected(self, leader_uid):
+        self._election_running = False
         am_leader = leader_uid == self.my_uid
 
         print("\n[NODE] ✓ Wahl abgeschlossen!")
@@ -142,11 +157,13 @@ class Node:
     def _on_leader_timeout(self):
         print("\n[NODE] Leader ausgefallen! Starte neue Wahl …\n")
 
-        self._lcr.leader_uid = ""
-        self._lcr.is_leader = False
+        self._lcr.reset_leader()
         self._leader_services_started = False
+        self._election_running = False
 
-        threading.Thread(target=self._election_loop, daemon=True).start()
+        # Kein neuer election_loop-Thread!
+        # Die bestehende election_loop erkennt den fehlenden Leader
+        # und startet die Wahl automatisch.
 
 
 if __name__ == "__main__":
@@ -157,6 +174,12 @@ if __name__ == "__main__":
     parser.add_argument("--hb-port", type=int, required=True)
     parser.add_argument("--chat-port", type=int, required=True)
     parser.add_argument("--ip", type=str, default=None)
+    parser.add_argument(
+        "--bootstrap",
+        action="append",
+        default=[],
+        help="Optional Hamachi/VPN peer IP for discovery fallback. Can be used multiple times."
+    )
 
     args = parser.parse_args()
 
@@ -168,6 +191,7 @@ if __name__ == "__main__":
         hb_port=args.hb_port,
         chat_port=args.chat_port,
         ip=args.ip,
+        bootstrap_peers=args.bootstrap,
     )
 
     node.start()

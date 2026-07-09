@@ -2,12 +2,13 @@ import socket
 import threading
 import uuid
 import time
+import argparse
 
 from discovery import DiscoveryClient
 
 
 class ChatClient:
-    def __init__(self, username):
+    def __init__(self, username, bootstrap_peers=None):
         self.username = username
         self.client_id = str(uuid.uuid4())
 
@@ -20,9 +21,14 @@ class ChatClient:
         self.reconnecting = False
 
         self.socket_lock = threading.Lock()
+        self.bootstrap_peers = bootstrap_peers or []
 
     def discover_leader(self):
-        dc = DiscoveryClient(timeout=3.0, retries=5)
+        dc = DiscoveryClient(
+            timeout=3.0,
+            retries=5,
+            bootstrap_peers=self.bootstrap_peers
+        )
         result = dc.find_leader()
 
         if result is None:
@@ -176,6 +182,16 @@ class ChatClient:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--bootstrap",
+        action="append",
+        default=[],
+        help="Optional Hamachi/VPN peer IP for leader discovery fallback. Can be used multiple times."
+    )
+
+    args = parser.parse_args()
+
     username = input("Benutzername eingeben: ")
-    client = ChatClient(username)
+    client = ChatClient(username, bootstrap_peers=args.bootstrap)
     client.start()

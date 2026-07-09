@@ -36,6 +36,7 @@ class ServerDiscovery:
         chat_port,
         on_members_changed=None,
         is_leader_func=None,
+        bootstrap_peers=None,
     ):
         self.my_uid = my_uid
         self.my_ip = my_ip
@@ -45,6 +46,7 @@ class ServerDiscovery:
 
         self.on_members_changed = on_members_changed
         self.is_leader_func = is_leader_func
+        self.bootstrap_peers = bootstrap_peers or []
 
         self.running = False
         self.members = {
@@ -92,7 +94,21 @@ class ServerDiscovery:
                 "chat_port": self.chat_port,
             }
 
-            sock.sendto(json.dumps(msg).encode("utf-8"), (BROADCAST_IP, DISCOVERY_PORT))
+            data = json.dumps(msg).encode("utf-8")
+
+            # Standard: UDP Broadcast wie bisher
+            try:
+                sock.sendto(data, (BROADCAST_IP, DISCOVERY_PORT))
+            except OSError as e:
+                print(f"[DISCOVERY] Broadcast send error: {e}")
+
+            # Fallback: direkte Discovery an bekannte Hamachi-/VPN-IPs
+            for peer_ip in self.bootstrap_peers:
+                try:
+                    sock.sendto(data, (peer_ip, DISCOVERY_PORT))
+                except OSError as e:
+                    print(f"[DISCOVERY] Bootstrap send error to {peer_ip}: {e}")
+
             time.sleep(2)
 
     def _listen_loop(self):
@@ -133,7 +149,12 @@ class ServerDiscovery:
         new_members = set(self.members.keys())
 
         if old_members != new_members:
-            print(f"[DISCOVERY] New server discovered: {uid[:8]}...")
+            print(
+                f"[DISCOVERY] New server discovered: "
+                f"{uid[:8]}... "
+                f"IP={msg['ip']} "
+                f"Ring={msg['ring_port']}"
+            )
             if self.on_members_changed:
                 self.on_members_changed(self.get_members())
 
@@ -171,9 +192,10 @@ class ServerDiscovery:
 
 
 class DiscoveryClient:
-    def __init__(self, timeout=3.0, retries=5):
+    def __init__(self, timeout=3.0, retries=5, bootstrap_peers=None):
         self.timeout = timeout
         self.retries = retries
+        self.bootstrap_peers = bootstrap_peers or []
 
     def find_leader(self):
         sock = create_udp_socket(broadcast=True)
@@ -181,12 +203,31 @@ class DiscoveryClient:
         sock.settimeout(self.timeout)
 
         msg = {"type": "DISCOVER_LEADER"}
+        data = json.dumps(msg).encode("utf-8")
 
         for attempt in range(1, self.retries + 1):
             print(f"[DISCOVERY] Suche Leader … (Versuch {attempt}/{self.retries})")
 
-            sock.sendto(json.dumps(msg).encode("utf-8"), (BROADCAST_IP, DISCOVERY_PORT))
+            # -------------------------------
+            # 1. Standard: UDP Broadcast
+            # -------------------------------
+            try:
+                sock.sendto(data, (BROADCAST_IP, DISCOVERY_PORT))
+            except OSError as e:
+                print(f"[DISCOVERY] Broadcast send error: {e}")
 
+            # -------------------------------
+            # 2. VPN-/Hamachi-Fallback
+            # -------------------------------
+            for peer_ip in self.bootstrap_peers:
+                try:
+                    sock.sendto(data, (peer_ip, DISCOVERY_PORT))
+                except OSError as e:
+                    print(f"[DISCOVERY] Bootstrap send error to {peer_ip}: {e}")
+
+            # -------------------------------
+            # 3. Auf Antwort warten
+            # -------------------------------
             try:
                 data, _ = sock.recvfrom(BUFFER_SIZE)
                 response = json.loads(data.decode("utf-8"))
@@ -196,6 +237,7 @@ class DiscoveryClient:
                     chat_port = response["chat_port"]
 
                     print(f"[DISCOVERY] ✓ Leader gefunden: {leader_ip}:{chat_port}")
+
                     sock.close()
                     return leader_ip, chat_port
 
